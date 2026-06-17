@@ -1,5 +1,7 @@
 import React, { useState, useMemo, useRef, useCallback } from 'react';
 import { Plus, Trash2 } from 'lucide-react';
+import katex from 'katex';
+import 'katex/dist/katex.min.css';
 
 const EPSILON = 1e-9;
 const BASE_COLORS = ['#ef4444', '#3b82f6', '#f59e0b', '#10b981', '#8b5cf6', '#ec4899', '#06b6d4'];
@@ -25,6 +27,15 @@ function blendMultipleColors(hexColors) {
   });
   let count = hexColors.length;
   return rgbToHex(Math.round(rSum/count), Math.round(gSum/count), Math.round(bSum/count));
+}
+
+function InlineMath({ children, className = '' }) {
+  const html = katex.renderToString(String(children), {
+    throwOnError: false,
+    strict: false,
+  });
+
+  return <span className={className} dangerouslySetInnerHTML={{ __html: html }} />;
 }
 
 // Helper to convert angles to Cartesian coordinates for SVG
@@ -344,7 +355,7 @@ export default function App() {
         <header className="mb-8">
           <h1 className="text-3xl font-bold text-slate-900 mb-2">Circle Group Visualizer</h1>
           <p className="text-slate-600">
-            Explore additive combinatorics on the circle group {"$\\mathbb{T} = \\mathbb{R}/\\mathbb{Z}$"}. Visualizing interval sets {"$A$"}, sumsets {"$A+A$"}, dilations {"$\\lambda A$"}, and mixed sets {"$A+A-\\lambda A$"}.
+            Explore additive combinatorics on the circle group <InlineMath>{'\\mathbb{T} = \\mathbb{R}/\\mathbb{Z}'}</InlineMath>. Visualizing interval sets <InlineMath>{'A'}</InlineMath>, sumsets <InlineMath>{'A+A'}</InlineMath>, dilations <InlineMath>{'\\lambda A'}</InlineMath>, and mixed sets <InlineMath>{'A+A-\\lambda A'}</InlineMath>.
           </p>
         </header>
 
@@ -518,11 +529,11 @@ export default function App() {
 
             {/* Lambda Multiplier */}
             <div className="bg-white p-5 rounded-2xl shadow-sm border border-slate-200">
-              <h2 className="font-bold text-lg mb-4">Scalar Multiplier ({"$\\lambda$"})</h2>
+              <h2 className="font-bold text-lg mb-4">Scalar Multiplier (<InlineMath>{'\\lambda'}</InlineMath>)</h2>
               
               <div>
                 <div className="flex justify-between text-sm mb-2">
-                  <label className="font-medium text-slate-700">Value of {"$\\lambda$"}</label>
+                  <label className="font-medium text-slate-700">Value of <InlineMath>{'\\lambda'}</InlineMath></label>
                   <span className="text-emerald-600 font-bold font-mono">{lambda}</span>
                 </div>
                 <div className="flex items-center gap-3">
