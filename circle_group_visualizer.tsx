@@ -212,13 +212,39 @@ export default function App() {
     return result;
   }, [intervals, lambda]);
 
+  // 4. Calculate A + A - lambda * A (blended colors)
+  const renderAPlusAMinusLambdaA = useMemo(() => {
+    let result = [];
+    for (let i = 0; i < intervals.length; i++) {
+      for (let j = i; j < intervals.length; j++) {
+        for (let k = 0; k < intervals.length; k++) {
+          let int1 = intervals[i];
+          let int2 = intervals[j];
+          let int3 = intervals[k];
+          let sumStart = (int1.center - int1.width / 2) + (int2.center - int2.width / 2);
+          let sumEnd = (int1.center + int1.width / 2) + (int2.center + int2.width / 2);
+          let scaledStart = -lambda * (int3.center - int3.width / 2);
+          let scaledEnd = -lambda * (int3.center + int3.width / 2);
+          let s = sumStart + Math.min(scaledStart, scaledEnd);
+          let e = sumEnd + Math.max(scaledStart, scaledEnd);
+          let blendedColor = blendMultipleColors([int1.color, int2.color, int3.color]);
+          getWrappedSegments(s, e).forEach(seg => {
+            result.push({ start: seg[0], end: seg[1], color: blendedColor });
+          });
+        }
+      }
+    }
+    return result;
+  }, [intervals, lambda]);
+
   const disjointA = useMemo(() => getDisjointSegments(renderA), [renderA]);
   const measureA = disjointA.measure;
   
   const measureAPlusA = useMemo(() => calculateMeasure(renderAPlusA), [renderAPlusA]);
   const measureLambdaA = useMemo(() => calculateMeasure(renderLambdaA), [renderLambdaA]);
+  const measureAPlusAMinusLambdaA = useMemo(() => calculateMeasure(renderAPlusAMinusLambdaA), [renderAPlusAMinusLambdaA]);
   
-  const scaleMax = 2;
+  const scaleMax = 3;
 
   const addInterval = useCallback(() => {
     setIntervals(prev => [
@@ -279,9 +305,10 @@ export default function App() {
     setDragState({ id: null, offset: 0 });
   }, []);
 
-  const RADIUS_A = 70;
-  const RADIUS_LAMBDA = 110;
-  const RADIUS_PLUS = 150;
+  const RADIUS_A = 60;
+  const RADIUS_LAMBDA = 100;
+  const RADIUS_PLUS = 140;
+  const RADIUS_MIXED = 180;
 
   return (
     <div className="min-h-screen bg-slate-50 text-slate-800 font-sans p-4 md:p-8 flex flex-col items-center">
@@ -290,7 +317,7 @@ export default function App() {
         <header className="mb-8">
           <h1 className="text-3xl font-bold text-slate-900 mb-2">Circle Group Visualizer</h1>
           <p className="text-slate-600">
-            Explore additive combinatorics on the circle group {"$\\mathbb{T} = \\mathbb{R}/\\mathbb{Z}$"}. Visualizing interval sets {"$A$"}, sumsets {"$A+A$"}, and dilations {"$\\lambda A$"}.
+            Explore additive combinatorics on the circle group {"$\\mathbb{T} = \\mathbb{R}/\\mathbb{Z}$"}. Visualizing interval sets {"$A$"}, sumsets {"$A+A$"}, dilations {"$\\lambda A$"}, and mixed sets {"$A+A-\\lambda A$"}.
           </p>
         </header>
 
@@ -298,24 +325,25 @@ export default function App() {
           
           {/* Canvas Section */}
           <div className="flex-1 bg-white rounded-2xl shadow-sm border border-slate-200 p-6 flex flex-col items-center justify-center min-h-[500px]">
-            <svg ref={svgRef} viewBox="-220 -220 440 440" className="w-full max-w-[440px] h-auto overflow-visible touch-none">
+            <svg ref={svgRef} viewBox="-250 -250 500 500" className="w-full max-w-[500px] h-auto overflow-visible touch-none">
               
               {/* Grid & Axes */}
               {[0, 0.25, 0.5, 0.75].map(turn => {
                 const p1 = polarToCartesian(0, 0, 40, turn);
-                const p2 = polarToCartesian(0, 0, 180, turn);
+                const p2 = polarToCartesian(0, 0, 220, turn);
                 return <line x1={p1.x} y1={p1.y} x2={p2.x} y2={p2.y} stroke="#e2e8f0" strokeWidth="2" strokeDasharray="4 4" key={`axis-${turn}`} />
               })}
               
-              <text x="0" y="-195" textAnchor="middle" className="text-sm font-semibold fill-slate-400">0</text>
-              <text x="195" y="0" textAnchor="start" alignmentBaseline="middle" className="text-sm font-semibold fill-slate-400">1/4</text>
-              <text x="0" y="195" textAnchor="middle" alignmentBaseline="hanging" className="text-sm font-semibold fill-slate-400">1/2</text>
-              <text x="-195" y="0" textAnchor="end" alignmentBaseline="middle" className="text-sm font-semibold fill-slate-400">3/4</text>
+              <text x="0" y="-235" textAnchor="middle" className="text-sm font-semibold fill-slate-400">0</text>
+              <text x="235" y="0" textAnchor="start" alignmentBaseline="middle" className="text-sm font-semibold fill-slate-400">1/4</text>
+              <text x="0" y="235" textAnchor="middle" alignmentBaseline="hanging" className="text-sm font-semibold fill-slate-400">1/2</text>
+              <text x="-235" y="0" textAnchor="end" alignmentBaseline="middle" className="text-sm font-semibold fill-slate-400">3/4</text>
 
               {/* Background Tracks */}
               <circle cx="0" cy="0" r={RADIUS_A} stroke="#f1f5f9" strokeWidth="16" fill="none" />
               <circle cx="0" cy="0" r={RADIUS_LAMBDA} stroke="#f1f5f9" strokeWidth="16" fill="none" />
               <circle cx="0" cy="0" r={RADIUS_PLUS} stroke="#f1f5f9" strokeWidth="16" fill="none" />
+              <circle cx="0" cy="0" r={RADIUS_MIXED} stroke="#f1f5f9" strokeWidth="16" fill="none" />
 
               {/* Plotted Arcs */}
               {renderA.map((seg, i) => (
@@ -339,6 +367,9 @@ export default function App() {
               {renderAPlusA.map((seg, i) => (
                 <Arc key={`P-${i}`} r={RADIUS_PLUS} start={seg.start} end={seg.end} color={seg.color} />
               ))}
+              {renderAPlusAMinusLambdaA.map((seg, i) => (
+                <Arc key={`M-${i}`} r={RADIUS_MIXED} start={seg.start} end={seg.end} color={seg.color} />
+              ))}
             </svg>
 
             {/* Legend inside canvas area */}
@@ -352,8 +383,12 @@ export default function App() {
                 <span className="font-bold text-sm text-slate-800">{lambda}A</span>
               </div>
               <div className="flex items-center gap-2">
-                <div className="font-medium text-sm text-slate-500">Outer Ring:</div>
+                <div className="font-medium text-sm text-slate-500">Third Ring:</div>
                 <span className="font-bold text-sm text-slate-800">A + A</span>
+              </div>
+              <div className="flex items-center gap-2">
+                <div className="font-medium text-sm text-slate-500">Outer Ring:</div>
+                <span className="font-bold text-sm text-slate-800">A + A - {lambda}A</span>
               </div>
             </div>
           </div>
@@ -537,8 +572,8 @@ export default function App() {
           {/* Outer Rings Density */}
           <div>
             <div className="flex justify-between items-end mb-2">
-              <h3 className="font-semibold text-sm text-slate-700">Density of Sumset & Dilate</h3>
-              <span className="text-xs text-slate-500 font-mono font-bold">Range: [0, 2]</span>
+              <h3 className="font-semibold text-sm text-slate-700">Density of Sumset, Dilate & Mixed Set</h3>
+              <span className="text-xs text-slate-500 font-mono font-bold">Range: [0, 3]</span>
             </div>
             
             <div className="relative pt-8 pb-2">
@@ -576,6 +611,15 @@ export default function App() {
                 >
                   {(measureLambdaA / scaleMax) > 0.04 ? measureLambdaA.toFixed(2) : ''}
                 </div>
+
+                {/* A+A-lambda A Bar */}
+                <div 
+                  className="h-full shrink-0 bg-sky-500 flex items-center justify-center text-xs font-bold text-white transition-all duration-300"
+                  style={{ width: `${(measureAPlusAMinusLambdaA / scaleMax) * 100}%` }}
+                  title={`Density of A+A-${lambda}A: ${measureAPlusAMinusLambdaA.toFixed(4)}`}
+                >
+                  {(measureAPlusAMinusLambdaA / scaleMax) > 0.04 ? measureAPlusAMinusLambdaA.toFixed(2) : ''}
+                </div>
               </div>
             </div>
           </div>
@@ -593,9 +637,13 @@ export default function App() {
               <span className="font-bold text-sm text-slate-500 uppercase">|{lambda}A| =</span>
               <span className="text-sm text-slate-800 font-bold">{measureLambdaA.toFixed(3)}</span>
             </div>
+            <div className="flex items-center gap-2">
+              <span className="font-bold text-sm text-slate-500 uppercase">|A + A - {lambda}A| =</span>
+              <span className="text-sm text-slate-800 font-bold">{measureAPlusAMinusLambdaA.toFixed(3)}</span>
+            </div>
             <div className="flex items-center gap-2 border-l pl-6 border-slate-200">
               <span className="font-bold text-sm text-slate-500">Outer Rings Sum:</span>
-              <span className="text-sm text-slate-800 font-bold">{(measureAPlusA + measureLambdaA).toFixed(3)}</span>
+              <span className="text-sm text-slate-800 font-bold">{(measureAPlusA + measureLambdaA + measureAPlusAMinusLambdaA).toFixed(3)}</span>
             </div>
           </div>
         </div>
