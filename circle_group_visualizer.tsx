@@ -1,10 +1,14 @@
-import React, { useState, useMemo, useRef, useCallback } from 'react';
+import React, { useState, useMemo, useRef, useCallback, useEffect } from 'react';
 import { Plus, Trash2 } from 'lucide-react';
 import katex from 'katex';
 import 'katex/dist/katex.min.css';
 
 const EPSILON = 1e-9;
 const BASE_COLORS = ['#ef4444', '#3b82f6', '#f59e0b', '#10b981', '#8b5cf6', '#ec4899', '#06b6d4'];
+const INITIAL_INTERVALS = [
+  { id: 1, start: 0.1, width: 0.1, color: BASE_COLORS[0] },
+  { id: 2, start: 0.575, width: 0.15, color: BASE_COLORS[1] },
+];
 
 function hexToRgb(hex) {
   let r = parseInt(hex.slice(1, 3), 16);
@@ -147,6 +151,248 @@ function getDisjointSegments(segments) {
   return { measure: Math.min(totalMeasure, 1), pieces: mergedPieces };
 }
 
+function normalizeTurn(value) {
+  return ((value % 1) + 1) % 1;
+}
+
+function clamp(value, min, max) {
+  return Math.min(Math.max(value, min), max);
+}
+
+function circularDistance(a, b) {
+  const diff = Math.abs(normalizeTurn(a) - normalizeTurn(b));
+  return Math.min(diff, 1 - diff);
+}
+
+function signedCircularDelta(value, origin) {
+  let delta = normalizeTurn(value) - normalizeTurn(origin);
+  if (delta > 0.5) delta -= 1;
+  if (delta < -0.5) delta += 1;
+  return delta;
+}
+
+function intervalSegments(start, width) {
+  if (width <= EPSILON) return [];
+  return getWrappedSegments(start, start + Math.min(width, 1));
+}
+
+function intervalsOverlapOnCircle(startA, widthA, startB, widthB) {
+  if (widthA <= EPSILON || widthB <= EPSILON) return false;
+
+  const segmentsA = intervalSegments(startA, widthA);
+  const segmentsB = intervalSegments(startB, widthB);
+  return segmentsA.some(a => (
+    segmentsB.some(b => Math.max(a[0], b[0]) < Math.min(a[1], b[1]) - EPSILON)
+  ));
+}
+
+function isStartAllowed(start, width, otherIntervals) {
+  return !otherIntervals.some(other => (
+    intervalsOverlapOnCircle(start, width, other.start, other.width)
+  ));
+}
+
+function getForbiddenStartSegments(width, otherIntervals) {
+  if (width <= EPSILON) return [];
+
+  const rawSegments = [];
+  for (const other of otherIntervals) {
+    if (other.width <= EPSILON) continue;
+
+    const forbiddenLength = width + other.width;
+    if (forbiddenLength >= 1 - EPSILON) {
+      return [{ start: 0, end: 1 }];
+    }
+
+    const start = normalizeTurn(other.start - width);
+    const end = start + forbiddenLength;
+    if (end <= 1 + EPSILON) {
+      rawSegments.push({ start, end: Math.min(end, 1) });
+    } else {
+      rawSegments.push({ start, end: 1 });
+      rawSegments.push({ start: 0, end: end - 1 });
+    }
+  }
+
+  if (rawSegments.length === 0) return [];
+
+  const sorted = rawSegments.sort((a, b) => a.start - b.start);
+  const merged = [];
+  let current = { ...sorted[0] };
+  for (let i = 1; i < sorted.length; i++) {
+    const segment = sorted[i];
+    if (segment.start <= current.end + EPSILON) {
+      current.end = Math.max(current.end, segment.end);
+    } else {
+      merged.push(current);
+      current = { ...segment };
+    }
+  }
+  merged.push(current);
+  return merged;
+}
+
+function forbiddenStartBackground(forbiddenSegments) {
+  const allowedColor = '#dbeafe';
+  const forbiddenColor = 'rgba(248, 113, 113, 0.5)';
+
+  if (!forbiddenSegments || forbiddenSegments.length === 0) return allowedColor;
+  if (forbiddenSegments.length === 1 && forbiddenSegments[0].start <= EPSILON && forbiddenSegments[0].end >= 1 - EPSILON) {
+    return forbiddenColor;
+  }
+
+  const stops = [];
+  let cursor = 0;
+  forbiddenSegments.forEach(segment => {
+    const start = clamp(segment.start, 0, 1);
+    const end = clamp(segment.end, 0, 1);
+    if (start > cursor + EPSILON) {
+      stops.push(`${allowedColor} ${cursor * 100}%`, `${allowedColor} ${start * 100}%`);
+    }
+    stops.push(`${forbiddenColor} ${start * 100}%`, `${forbiddenColor} ${end * 100}%`);
+    cursor = Math.max(cursor, end);
+  });
+
+  if (cursor < 1 - EPSILON) {
+    stops.push(`${allowedColor} ${cursor * 100}%`, `${allowedColor} 100%`);
+  }
+
+  return `linear-gradient(to right, ${stops.join(', ')})`;
+}
+
+function snapStartToAllowed(desiredStart, width, otherIntervals, fallbackStart) {
+  const desired = normalizeTurn(desiredStart);
+  if (width <= EPSILON || isStartAllowed(desired, width, otherIntervals)) return desired;
+  if (width + otherIntervals.reduce((sum, interval) => sum + interval.width, 0) > 1 + EPSILON) {
+    return normalizeTurn(fallbackStart);
+  }
+
+  const candidates = [];
+  otherIntervals.forEach(other => {
+    candidates.push(normalizeTurn(other.start + other.width));
+    candidates.push(normalizeTurn(other.start - width));
+  });
+
+  let bestStart = normalizeTurn(fallbackStart);
+  let bestDistance = Infinity;
+  candidates.forEach(candidate => {
+    if (!isStartAllowed(candidate, width, otherIntervals)) return;
+    const distance = circularDistance(candidate, desired);
+    if (distance < bestDistance) {
+      bestDistance = distance;
+      bestStart = candidate;
+    }
+  });
+
+  return bestStart;
+}
+
+function packIntervalsClockwise(intervals, anchorId = intervals[0]?.id) {
+  if (intervals.length <= 1) {
+    return intervals.map(interval => ({ ...interval, start: normalizeTurn(interval.start) }));
+  }
+
+  const totalWidth = intervals.reduce((sum, interval) => sum + interval.width, 0);
+  if (totalWidth > 1 + EPSILON) return intervals;
+
+  const anchor = intervals.find(interval => interval.id === anchorId) || intervals[0];
+  const anchorStart = normalizeTurn(anchor.start);
+  const ordered = [...intervals].sort((a, b) => {
+    if (a.id === anchor.id) return -1;
+    if (b.id === anchor.id) return 1;
+    return normalizeTurn(a.start - anchorStart) - normalizeTurn(b.start - anchorStart);
+  });
+
+  const packedById = new Map();
+  let currentEnd = anchorStart;
+  ordered.forEach((interval, index) => {
+    let liftedStart = index === 0 ? anchorStart : anchorStart + normalizeTurn(interval.start - anchorStart);
+    if (index > 0 && liftedStart < currentEnd - EPSILON) {
+      liftedStart = currentEnd;
+    }
+
+    packedById.set(interval.id, { ...interval, start: normalizeTurn(liftedStart) });
+    currentEnd = liftedStart + interval.width;
+  });
+
+  return intervals.map(interval => packedById.get(interval.id) || interval);
+}
+
+function scaleIntervalsToTotal(intervals, targetTotal) {
+  if (intervals.length === 0) return intervals;
+
+  const total = intervals.reduce((sum, interval) => sum + interval.width, 0);
+  if (targetTotal <= EPSILON) {
+    return intervals.map(interval => ({ ...interval, width: 0 }));
+  }
+
+  if (total <= EPSILON) {
+    const equalWidth = targetTotal / intervals.length;
+    return intervals.map(interval => ({ ...interval, width: equalWidth }));
+  }
+
+  const scale = targetTotal / total;
+  return intervals.map(interval => ({ ...interval, width: interval.width * scale }));
+}
+
+function balanceWidthsToTarget(intervals, targetTotal, preferredIndex = 0) {
+  if (intervals.length === 0) return intervals;
+
+  const balanced = intervals.map(interval => ({ ...interval, width: Math.max(0, interval.width) }));
+  let diff = targetTotal - balanced.reduce((sum, interval) => sum + interval.width, 0);
+  const preferred = ((preferredIndex % balanced.length) + balanced.length) % balanced.length;
+
+  if (diff > EPSILON) {
+    balanced[preferred].width += diff;
+  } else if (diff < -EPSILON) {
+    let remaining = -diff;
+    for (let step = 0; step < balanced.length && remaining > EPSILON; step++) {
+      const index = (preferred + step) % balanced.length;
+      const reduction = Math.min(balanced[index].width, remaining);
+      balanced[index].width -= reduction;
+      remaining -= reduction;
+    }
+  }
+
+  return balanced;
+}
+
+function resizeWithFixedTotal(intervals, intervalIndex, requestedWidth, targetTotal) {
+  if (intervals.length === 0) return intervals;
+
+  const next = intervals.map(interval => ({ ...interval }));
+  const index = ((intervalIndex % next.length) + next.length) % next.length;
+  const nextIndex = (index + 1) % next.length;
+
+  if (next.length === 1) {
+    next[index].width = targetTotal;
+    return next;
+  }
+
+  const currentWidth = next[index].width;
+  const desiredWidth = clamp(requestedWidth, 0, targetTotal);
+  let delta = desiredWidth - currentWidth;
+  next[index].width = desiredWidth;
+
+  if (delta > EPSILON) {
+    let remaining = delta;
+    for (let step = 1; step < next.length && remaining > EPSILON; step++) {
+      const donorIndex = (index + step) % next.length;
+      const reduction = Math.min(next[donorIndex].width, remaining);
+      next[donorIndex].width -= reduction;
+      remaining -= reduction;
+    }
+
+    if (remaining > EPSILON) {
+      next[index].width = Math.max(0, next[index].width - remaining);
+    }
+  } else if (delta < -EPSILON) {
+    next[nextIndex].width += -delta;
+  }
+
+  return balanceWidthsToTarget(next, targetTotal, nextIndex);
+}
+
 // Reusable component to draw an arc on the circle
 function Arc({ r, start, end, color, className, style, ...rest }) {
   const mergedStyle = { mixBlendMode: 'multiply', ...style };
@@ -170,12 +416,13 @@ function Arc({ r, start, end, color, className, style, ...rest }) {
 }
 
 export default function App() {
-  const [intervals, setIntervals] = useState([
-    { id: 1, center: 0.15, width: 0.1, color: BASE_COLORS[0] },
-    { id: 2, center: 0.65, width: 0.15, color: BASE_COLORS[1] },
-  ]);
+  const [intervals, setIntervals] = useState(INITIAL_INTERVALS);
   const [lambda, setLambda] = useState(3);
   const [hiddenMixedComboKeys, setHiddenMixedComboKeys] = useState([]);
+  const [fixTotalLength, setFixTotalLength] = useState(false);
+  const [targetTotalLength, setTargetTotalLength] = useState(
+    INITIAL_INTERVALS.reduce((sum, interval) => sum + interval.width, 0)
+  );
 
   const svgRef = useRef(null);
   const [dragState, setDragState] = useState({ id: null, offset: 0 });
@@ -184,8 +431,8 @@ export default function App() {
   const renderA = useMemo(() => {
     let result = [];
     intervals.forEach(i => {
-      let s = i.center - i.width / 2;
-      let e = i.center + i.width / 2;
+      let s = i.start;
+      let e = i.start + i.width;
       getWrappedSegments(s, e).forEach(seg => {
         result.push({ id: i.id, start: seg[0], end: seg[1], color: i.color });
       });
@@ -200,8 +447,8 @@ export default function App() {
       for (let j = i; j < intervals.length; j++) {
         let int1 = intervals[i];
         let int2 = intervals[j];
-        let s = (int1.center - int1.width / 2) + (int2.center - int2.width / 2);
-        let e = (int1.center + int1.width / 2) + (int2.center + int2.width / 2);
+        let s = int1.start + int2.start;
+        let e = (int1.start + int1.width) + (int2.start + int2.width);
         let blendedColor = blendMultipleColors([int1.color, int2.color]);
         getWrappedSegments(s, e).forEach(seg => {
           result.push({ start: seg[0], end: seg[1], color: blendedColor });
@@ -215,8 +462,8 @@ export default function App() {
   const renderLambdaA = useMemo(() => {
     let result = [];
     intervals.forEach(i => {
-      let s = lambda * (i.center - i.width / 2);
-      let e = lambda * (i.center + i.width / 2);
+      let s = lambda * i.start;
+      let e = lambda * (i.start + i.width);
       getWrappedSegments(s, e).forEach(seg => {
         result.push({ start: seg[0], end: seg[1], color: i.color });
       });
@@ -256,10 +503,10 @@ export default function App() {
     mixedCombinations.forEach(combo => {
       if (canFilterMixedCombinations && hiddenKeys.has(combo.key)) return;
 
-      let sumStart = (combo.int1.center - combo.int1.width / 2) + (combo.int2.center - combo.int2.width / 2);
-      let sumEnd = (combo.int1.center + combo.int1.width / 2) + (combo.int2.center + combo.int2.width / 2);
-      let scaledStart = -lambda * (combo.int3.center - combo.int3.width / 2);
-      let scaledEnd = -lambda * (combo.int3.center + combo.int3.width / 2);
+      let sumStart = combo.int1.start + combo.int2.start;
+      let sumEnd = (combo.int1.start + combo.int1.width) + (combo.int2.start + combo.int2.width);
+      let scaledStart = -lambda * combo.int3.start;
+      let scaledEnd = -lambda * (combo.int3.start + combo.int3.width);
       let s = sumStart + Math.min(scaledStart, scaledEnd);
       let e = sumEnd + Math.max(scaledStart, scaledEnd);
       getWrappedSegments(s, e).forEach(seg => {
@@ -276,21 +523,86 @@ export default function App() {
   const measureLambdaA = useMemo(() => calculateMeasure(renderLambdaA), [renderLambdaA]);
   const measureAPlusAMinusLambdaA = useMemo(() => calculateMeasure(renderAPlusAMinusLambdaA), [renderAPlusAMinusLambdaA]);
   
-  const scaleMax = 2;
+  const totalIntervalLength = useMemo(() => (
+    intervals.reduce((sum, interval) => sum + interval.width, 0)
+  ), [intervals]);
+  const displayedTotalLength = fixTotalLength ? targetTotalLength : totalIntervalLength;
+
+  useEffect(() => {
+    if (!fixTotalLength) {
+      setTargetTotalLength(totalIntervalLength);
+    }
+  }, [fixTotalLength, totalIntervalLength]);
 
   const addInterval = useCallback(() => {
-    setIntervals(prev => [
-      ...prev, 
-      { id: Date.now(), center: 0.5, width: 0.1, color: BASE_COLORS[prev.length % BASE_COLORS.length] }
-    ]);
-  }, []);
+    setIntervals(prev => {
+      const usedLength = prev.reduce((sum, interval) => sum + interval.width, 0);
+      const width = fixTotalLength ? 0 : Math.min(0.1, Math.max(0, 1 - usedLength));
+      const newInterval = {
+        id: Date.now(),
+        start: 0.5,
+        width,
+        color: BASE_COLORS[prev.length % BASE_COLORS.length],
+      };
+      newInterval.start = snapStartToAllowed(newInterval.start, newInterval.width, prev, 0);
+      return packIntervalsClockwise([...prev, newInterval], newInterval.id);
+    });
+  }, [fixTotalLength]);
 
   const removeInterval = useCallback((id) => {
-    setIntervals(prev => prev.filter(i => i.id !== id));
+    setIntervals(prev => {
+      const next = prev.filter(i => i.id !== id);
+      if (!fixTotalLength) return next;
+      return packIntervalsClockwise(scaleIntervalsToTotal(next, targetTotalLength), next[0]?.id);
+    });
+  }, [fixTotalLength, targetTotalLength]);
+
+  const updateIntervalColor = useCallback((id, value) => {
+    setIntervals(prev => prev.map(i => i.id === id ? { ...i, color: value } : i));
   }, []);
 
-  const updateInterval = useCallback((id, field, value) => {
-    setIntervals(prev => prev.map(i => i.id === id ? { ...i, [field]: value } : i));
+  const moveIntervalStart = useCallback((id, requestedStart) => {
+    setIntervals(prev => {
+      const interval = prev.find(i => i.id === id);
+      if (!interval) return prev;
+
+      const others = prev.filter(i => i.id !== id);
+      const snappedStart = snapStartToAllowed(requestedStart, interval.width, others, interval.start);
+      return prev.map(i => i.id === id ? { ...i, start: snappedStart } : i);
+    });
+  }, []);
+
+  const changeIntervalWidth = useCallback((id, requestedWidth) => {
+    setIntervals(prev => {
+      const intervalIndex = prev.findIndex(i => i.id === id);
+      if (intervalIndex === -1) return prev;
+
+      const requested = clamp(requestedWidth, 0, 1);
+      let next;
+
+      if (fixTotalLength) {
+        next = resizeWithFixedTotal(prev, intervalIndex, requested, targetTotalLength);
+      } else {
+        const otherWidth = prev.reduce((sum, interval) => interval.id === id ? sum : sum + interval.width, 0);
+        const width = clamp(requested, 0, Math.max(0, 1 - otherWidth));
+        next = prev.map(interval => interval.id === id ? { ...interval, width } : interval);
+      }
+
+      return packIntervalsClockwise(next, id);
+    });
+  }, [fixTotalLength, targetTotalLength]);
+
+  const handleFixTotalLengthChange = useCallback((checked) => {
+    setFixTotalLength(checked);
+    if (checked) {
+      setIntervals(prev => packIntervalsClockwise(scaleIntervalsToTotal(prev, targetTotalLength), prev[0]?.id));
+    }
+  }, [targetTotalLength]);
+
+  const handleTargetTotalLengthChange = useCallback((value) => {
+    const nextTarget = clamp(value, 0, 1);
+    setTargetTotalLength(nextTarget);
+    setIntervals(prev => packIntervalsClockwise(scaleIntervalsToTotal(prev, nextTarget), prev[0]?.id));
   }, []);
 
   const toggleMixedCombination = useCallback((key) => {
@@ -319,12 +631,7 @@ export default function App() {
     const interval = intervals.find(i => i.id === segId);
     if (!interval) return;
     
-    // Calculate how far the click was from the interval's exact center
-    let offset = angle - interval.center;
-    // Normalize offset to be between -0.5 and 0.5
-    if (offset > 0.5) offset -= 1;
-    if (offset < -0.5) offset += 1;
-    
+    const offset = signedCircularDelta(angle, interval.start);
     setDragState({ id: segId, offset });
   }, [intervals, getAngleFromEvent]);
 
@@ -332,11 +639,8 @@ export default function App() {
     if (dragState.id !== segId) return;
     
     const angle = getAngleFromEvent(e);
-    let newCenter = angle - dragState.offset;
-    newCenter = ((newCenter % 1) + 1) % 1; // Ensure wrap-around safely
-    
-    updateInterval(segId, 'center', newCenter);
-  }, [dragState, getAngleFromEvent, updateInterval]);
+    moveIntervalStart(segId, angle - dragState.offset);
+  }, [dragState, getAngleFromEvent, moveIntervalStart]);
 
   const handlePointerUp = useCallback((e) => {
     e.target.releasePointerCapture(e.pointerId);
@@ -351,15 +655,16 @@ export default function App() {
   return (
     <div className="min-h-screen bg-slate-50 text-slate-800 font-sans p-4 md:p-8 flex flex-col items-center">
       
-      <div className="max-w-6xl w-full">
-        <header className="mb-8">
+      <div className="max-w-[1600px] w-full">
+        <header className="mb-6">
           <h1 className="text-3xl font-bold text-slate-900 mb-2">Circle Group Visualizer</h1>
           <p className="text-slate-600">
             Explore additive combinatorics on the circle group <InlineMath>{'\\mathbb{T} = \\mathbb{R}/\\mathbb{Z}'}</InlineMath>. Visualizing interval sets <InlineMath>{'A'}</InlineMath>, sumsets <InlineMath>{'A+A'}</InlineMath>, dilations <InlineMath>{'\\lambda A'}</InlineMath>, and mixed sets <InlineMath>{'A+A-\\lambda A'}</InlineMath>.
           </p>
         </header>
 
-        <div className="flex flex-col lg:flex-row gap-8">
+        <div className="flex flex-col xl:flex-row gap-8 items-start">
+          <div className="flex flex-col lg:flex-row gap-8 flex-1 min-w-0 w-full">
           
           {/* Canvas Section */}
           <div className="flex-1 bg-white rounded-2xl shadow-sm border border-slate-200 p-6 flex flex-col items-center justify-center min-h-[500px]">
@@ -414,19 +719,23 @@ export default function App() {
             <div className="mt-8 flex flex-wrap justify-center gap-6">
               <div className="flex items-center gap-2">
                 <div className="font-medium text-sm text-slate-500">Inner Ring:</div>
-                <span className="font-bold text-sm text-slate-800">Set A</span>
+                <span className="font-bold text-sm text-slate-800">Set A.</span>
+                <span className="font-bold text-sm text-slate-500 font-mono">{measureA.toFixed(3)}</span>
               </div>
               <div className="flex items-center gap-2">
                 <div className="font-medium text-sm text-slate-500">Middle Ring:</div>
-                <span className="font-bold text-sm text-slate-800">{lambda}A</span>
+                <span className="font-bold text-sm text-slate-800">{lambda}A.</span>
+                <span className="font-bold text-sm text-slate-500 font-mono">{measureLambdaA.toFixed(3)}</span>
               </div>
               <div className="flex items-center gap-2">
                 <div className="font-medium text-sm text-slate-500">Third Ring:</div>
-                <span className="font-bold text-sm text-slate-800">A + A</span>
+                <span className="font-bold text-sm text-slate-800">A + A.</span>
+                <span className="font-bold text-sm text-slate-500 font-mono">{measureAPlusA.toFixed(3)}</span>
               </div>
               <div className="flex items-center gap-2">
                 <div className="font-medium text-sm text-slate-500">Outer Ring:</div>
-                <span className="font-bold text-sm text-slate-800">A + A - {lambda}A</span>
+                <span className="font-bold text-sm text-slate-800">A + A - {lambda}A.</span>
+                <span className="font-bold text-sm text-slate-500 font-mono">{measureAPlusAMinusLambdaA.toFixed(3)}</span>
               </div>
             </div>
           </div>
@@ -447,77 +756,84 @@ export default function App() {
               </div>
 
               <div className="space-y-4">
-                {intervals.map((interval, index) => (
-                  <div key={interval.id} className="p-4 bg-slate-50 rounded-xl border border-slate-100 relative group" style={{ borderLeftColor: interval.color, borderLeftWidth: '6px' }}>
-                    <div className="flex justify-between items-center mb-3">
-                      <div className="flex items-center gap-2">
-                        <input 
-                          type="color" 
-                          value={interval.color}
-                          onChange={(e) => updateInterval(interval.id, 'color', e.target.value)}
-                          className="w-6 h-6 rounded cursor-pointer p-0 border border-slate-200 bg-white"
-                          title="Pick interval color"
-                        />
-                        <h3 className="text-xs font-bold text-slate-500 uppercase tracking-wider">Interval {index + 1}</h3>
-                      </div>
-                      <button 
-                        onClick={() => removeInterval(interval.id)}
-                        className="text-slate-400 hover:text-red-500 transition-colors"
-                        title="Remove interval"
-                      >
-                        <Trash2 size={16} />
-                      </button>
-                    </div>
-                    
-                    <div className="space-y-3">
-                      <div>
-                        <div className="flex justify-between text-sm mb-1">
-                          <label className="font-medium text-slate-700">Center Position</label>
+                {intervals.map((interval, index) => {
+                  const otherIntervals = intervals.filter(i => i.id !== interval.id);
+                  const forbiddenSegments = getForbiddenStartSegments(interval.width, otherIntervals);
+                  const startBackground = forbiddenStartBackground(forbiddenSegments);
+
+                  return (
+                    <div key={interval.id} className="p-4 bg-slate-50 rounded-xl border border-slate-100 relative group" style={{ borderLeftColor: interval.color, borderLeftWidth: '6px' }}>
+                      <div className="flex justify-between items-center mb-3">
+                        <div className="flex items-center gap-2">
                           <input 
-                            type="number" 
-                            step="0.01" 
-                            min="0" max="1"
-                            value={Number(interval.center).toString()}
-                            onChange={(e) => {
-                              const val = parseFloat(e.target.value);
-                              if (!isNaN(val)) updateInterval(interval.id, 'center', val);
-                            }}
-                            className="w-20 px-1 text-right border border-slate-200 rounded font-mono text-sm text-slate-700 focus:outline-none focus:ring-1 focus:ring-blue-500"
+                            type="color" 
+                            value={interval.color}
+                            onChange={(e) => updateIntervalColor(interval.id, e.target.value)}
+                            className="w-6 h-6 rounded cursor-pointer p-0 border border-slate-200 bg-white"
+                            title="Pick interval color"
                           />
+                          <h3 className="text-xs font-bold text-slate-500 uppercase tracking-wider">Interval {index + 1}</h3>
                         </div>
-                        <input 
-                          type="range" min="0" max="1" step="0.01" 
-                          value={interval.center}
-                          onChange={(e) => updateInterval(interval.id, 'center', parseFloat(e.target.value))}
-                          className="w-full accent-blue-500"
-                        />
+                        <button 
+                          onClick={() => removeInterval(interval.id)}
+                          className="text-slate-400 hover:text-red-500 transition-colors"
+                          title="Remove interval"
+                        >
+                          <Trash2 size={16} />
+                        </button>
                       </div>
                       
-                      <div>
-                        <div className="flex justify-between text-sm mb-1">
-                          <label className="font-medium text-slate-700">Width</label>
+                      <div className="space-y-3">
+                        <div>
+                          <div className="flex justify-between text-sm mb-1">
+                            <label className="font-medium text-slate-700">Start Position</label>
+                            <input 
+                              type="number" 
+                              step="0.01" 
+                              min="0" max="1"
+                              value={Number(interval.start).toString()}
+                              onChange={(e) => {
+                                const val = parseFloat(e.target.value);
+                                if (!isNaN(val)) moveIntervalStart(interval.id, val);
+                              }}
+                              className="w-20 px-1 text-right border border-slate-200 rounded font-mono text-sm text-slate-700 focus:outline-none focus:ring-1 focus:ring-blue-500"
+                            />
+                          </div>
                           <input 
-                            type="number" 
-                            step="0.001" 
-                            min="0" max="1"
-                            value={Number(interval.width).toString()}
-                            onChange={(e) => {
-                              const val = parseFloat(e.target.value);
-                              if (!isNaN(val)) updateInterval(interval.id, 'width', val);
-                            }}
-                            className="w-20 px-1 text-right border border-slate-200 rounded font-mono text-sm text-slate-700 focus:outline-none focus:ring-1 focus:ring-blue-500"
+                            type="range" min="0" max="1" step="0.01" 
+                            value={interval.start}
+                            onChange={(e) => moveIntervalStart(interval.id, parseFloat(e.target.value))}
+                            className="interval-start-range w-full"
+                            style={{ background: startBackground }}
                           />
                         </div>
-                        <input 
-                          type="range" min="0" max="1" step="0.001" 
-                          value={interval.width}
-                          onChange={(e) => updateInterval(interval.id, 'width', parseFloat(e.target.value))}
-                          className="w-full accent-blue-500"
-                        />
+                        
+                        <div>
+                          <div className="flex justify-between text-sm mb-1">
+                            <label className="font-medium text-slate-700">Width</label>
+                            <input 
+                              type="number" 
+                              step="0.001" 
+                              min="0" max="1"
+                              value={Number(interval.width).toString()}
+                              onChange={(e) => {
+                                const val = parseFloat(e.target.value);
+                                if (!isNaN(val)) changeIntervalWidth(interval.id, val);
+                              }}
+                              className="w-20 px-1 text-right border border-slate-200 rounded font-mono text-sm text-slate-700 focus:outline-none focus:ring-1 focus:ring-blue-500"
+                            />
+                          </div>
+                          <input 
+                            type="range" min="0" max="1" step="0.001" 
+                            value={interval.width}
+                            onChange={(e) => changeIntervalWidth(interval.id, parseFloat(e.target.value))}
+                            className="w-full accent-blue-500"
+                          />
+                        </div>
                       </div>
                     </div>
-                  </div>
-                ))}
+                  );
+                })}
                 
                 {intervals.length === 0 && (
                   <div className="text-center p-6 text-sm text-slate-500 bg-slate-50 rounded-xl border border-dashed border-slate-200">
@@ -527,6 +843,59 @@ export default function App() {
               </div>
             </div>
 
+            {/* Total Length Constraint */}
+            <div className="bg-white p-5 rounded-2xl shadow-sm border border-slate-200">
+              <div className="flex items-center justify-between gap-4 mb-4">
+                <h2 className="font-bold text-lg">Total Length</h2>
+                <label className="flex items-center gap-2 text-sm font-bold text-slate-700 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={fixTotalLength}
+                    onChange={(e) => handleFixTotalLengthChange(e.target.checked)}
+                    className="h-4 w-4 accent-blue-500"
+                  />
+                  Fixed
+                </label>
+              </div>
+
+              <div className="space-y-3">
+                <div className="flex justify-between text-sm mb-1">
+                  <label className="font-medium text-slate-700">Total</label>
+                  <input
+                    type="number"
+                    step="0.001"
+                    min="0"
+                    max="1"
+                    value={Number(displayedTotalLength).toString()}
+                    onChange={(e) => {
+                      const val = parseFloat(e.target.value);
+                      if (!isNaN(val)) handleTargetTotalLengthChange(val);
+                    }}
+                    className="w-20 px-1 text-right border border-slate-200 rounded font-mono text-sm text-slate-700 focus:outline-none focus:ring-1 focus:ring-blue-500"
+                  />
+                </div>
+                <input
+                  type="range"
+                  min="0"
+                  max="1"
+                  step="0.001"
+                  value={displayedTotalLength}
+                  onChange={(e) => handleTargetTotalLengthChange(parseFloat(e.target.value))}
+                  className="w-full accent-blue-500"
+                />
+                <div className="flex justify-between text-xs font-bold text-slate-500">
+                  <span>Current</span>
+                  <span className={fixTotalLength ? 'text-blue-600 font-mono' : 'font-mono'}>
+                    {totalIntervalLength.toFixed(3)}
+                  </span>
+                </div>
+              </div>
+            </div>
+
+          </div>
+          </div>
+
+          <div className="w-full xl:w-[420px] xl:shrink-0 flex flex-col gap-6">
             {/* Lambda Multiplier */}
             <div className="bg-white p-5 rounded-2xl shadow-sm border border-slate-200">
               <h2 className="font-bold text-lg mb-4">Scalar Multiplier (<InlineMath>{'\\lambda'}</InlineMath>)</h2>
@@ -582,7 +951,7 @@ export default function App() {
                   </div>
                 </div>
 
-                <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-1 gap-2">
+                <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 xl:grid-cols-2 gap-2">
                   {mixedCombinations.map(combo => (
                     <label
                       key={combo.key}
@@ -601,122 +970,9 @@ export default function App() {
                 </div>
               </div>
             )}
-            
           </div>
+
         </div>
-
-        {/* Density Charts */}
-        <div className="mt-8 bg-white p-6 rounded-2xl shadow-sm border border-slate-200">
-          <h2 className="font-bold text-lg text-slate-800 mb-6">Density Measurements</h2>
-          
-          {/* Base Set A Density */}
-          <div className="mb-8">
-            <div className="flex justify-between items-end mb-2">
-              <h3 className="font-semibold text-sm text-slate-700">Density of Base Set A</h3>
-              <span className="text-xs text-slate-500 font-mono font-bold">Range: [0, 1]</span>
-            </div>
-            
-            <div className="relative pt-6 pb-2">
-              {/* Tick Marks */}
-              <div className="absolute top-0 left-0 right-0 bottom-2 pointer-events-none z-10">
-                {Array.from({ length: 11 }, (_, i) => i / 10).map((tick) => (
-                  <div 
-                    key={tick}
-                    className="absolute top-0 flex flex-col items-center h-full"
-                    style={{ left: `${tick * 100}%`, transform: 'translateX(-50%)' }}
-                  >
-                    <span className="text-[10px] sm:text-xs font-bold text-slate-500 bg-white px-0.5 sm:px-1 mb-1">
-                      {tick === 0 || tick === 1 ? tick : tick.toFixed(1)}
-                    </span>
-                    <div className="w-px flex-1 bg-slate-800 opacity-20 mix-blend-multiply"></div>
-                  </div>
-                ))}
-              </div>
-              
-              <div className="h-10 bg-slate-100 rounded-lg overflow-hidden flex w-full relative border border-slate-200">
-                {/* Set A Bar */}
-                <div className="h-full flex relative shrink-0" style={{ width: `${measureA * 100}%` }}>
-                  {measureA > 0 && disjointA.pieces.map((p, i) => (
-                    <div key={i} className="h-full" style={{ width: `${(p.width / measureA) * 100}%`, backgroundColor: p.color }} />
-                  ))}
-                  <div className="absolute inset-0 flex items-center justify-center text-xs font-bold text-white pointer-events-none" style={{ textShadow: '0 1px 2px rgba(0,0,0,0.8)' }}>
-                    {measureA > 0.04 ? measureA.toFixed(2) : ''}
-                  </div>
-                </div>
-              </div>
-            </div>
-          </div>
-
-          {/* Outer Rings Density */}
-          <div>
-            <div className="flex justify-between items-end mb-2">
-              <h3 className="font-semibold text-sm text-slate-700">Density of Sumset & Dilate</h3>
-              <span className="text-xs text-slate-500 font-mono font-bold">Range: [0, 2]</span>
-            </div>
-            
-            <div className="relative pt-8 pb-2">
-              {/* Tick Marks and Grid Lines */}
-              <div className="absolute top-0 left-0 right-0 bottom-2 pointer-events-none z-10">
-                {Array.from({ length: scaleMax + 1 }).map((_, i) => (
-                  <div 
-                    key={i}
-                    className={`absolute top-0 flex flex-col items-center h-full ${i === 1 ? 'z-20' : ''}`}
-                    style={{ left: `${(i / scaleMax) * 100}%`, transform: 'translateX(-50%)' }}
-                  >
-                    <span className={`text-xs font-bold bg-white px-1 mb-1 ${i === 1 ? 'text-red-600 ring-1 ring-red-200 rounded shadow-sm px-2 py-0.5' : 'text-slate-500'}`}>
-                      {i}
-                    </span>
-                    <div className={`flex-1 mix-blend-multiply ${i === 1 ? 'w-0.5 bg-red-400 opacity-80' : 'w-px bg-slate-800 opacity-20'}`}></div>
-                  </div>
-                ))}
-              </div>
-              
-              <div className="h-10 bg-slate-100 rounded-lg overflow-hidden flex w-full relative border border-slate-200">
-                {/* A+A Bar */}
-                <div 
-                  className="h-full shrink-0 bg-violet-500 flex items-center justify-center text-xs font-bold text-white transition-all duration-300"
-                  style={{ width: `${(measureAPlusA / scaleMax) * 100}%` }}
-                  title={`Density of A+A: ${measureAPlusA.toFixed(4)}`}
-                >
-                  {(measureAPlusA / scaleMax) > 0.04 ? measureAPlusA.toFixed(2) : ''}
-                </div>
-                
-                {/* Lambda A Bar */}
-                <div 
-                  className="h-full shrink-0 bg-emerald-500 flex items-center justify-center text-xs font-bold text-white transition-all duration-300"
-                  style={{ width: `${(measureLambdaA / scaleMax) * 100}%` }}
-                  title={`Density of ${lambda}A: ${measureLambdaA.toFixed(4)}`}
-                >
-                  {(measureLambdaA / scaleMax) > 0.04 ? measureLambdaA.toFixed(2) : ''}
-                </div>
-              </div>
-            </div>
-          </div>
-            
-          <div className="flex flex-wrap justify-center gap-6 mt-8 pt-6 border-t border-slate-100">
-            <div className="flex items-center gap-2">
-              <span className="font-bold text-sm text-slate-500 uppercase">|A| =</span>
-              <span className="text-sm text-slate-800 font-bold">{measureA.toFixed(3)}</span>
-            </div>
-            <div className="flex items-center gap-2">
-              <span className="font-bold text-sm text-slate-500 uppercase">|A + A| =</span>
-              <span className="text-sm text-slate-800 font-bold">{measureAPlusA.toFixed(3)}</span>
-            </div>
-            <div className="flex items-center gap-2">
-              <span className="font-bold text-sm text-slate-500 uppercase">|{lambda}A| =</span>
-              <span className="text-sm text-slate-800 font-bold">{measureLambdaA.toFixed(3)}</span>
-            </div>
-            <div className="flex items-center gap-2">
-              <span className="font-bold text-sm text-slate-500 uppercase">|A + A - {lambda}A| =</span>
-              <span className="text-sm text-slate-800 font-bold">{measureAPlusAMinusLambdaA.toFixed(3)}</span>
-            </div>
-            <div className="flex items-center gap-2 border-l pl-6 border-slate-200">
-              <span className="font-bold text-sm text-slate-500">Outer Rings Sum:</span>
-              <span className="text-sm text-slate-800 font-bold">{(measureAPlusA + measureLambdaA).toFixed(3)}</span>
-            </div>
-          </div>
-        </div>
-
       </div>
     </div>
   );
