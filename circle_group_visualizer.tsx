@@ -525,6 +525,43 @@ function normalizeSharedIntervals(rawIntervals) {
   return packIntervalsClockwise(intervals, intervals[0]?.id);
 }
 
+function normalizeSharedSetup(shared, defaults = getDefaultSetup()) {
+  if (!shared || typeof shared !== 'object' || Array.isArray(shared)) {
+    throw new Error('Invalid state');
+  }
+
+  let intervals = normalizeSharedIntervals(shared?.intervals);
+  const lambda = Number.isFinite(Number(shared?.lambda)) ? Number(shared.lambda) : defaults.lambda;
+  const fixTotalLength = shared?.fixTotalLength === true;
+  let targetTotalLength = clamp(
+    Number(shared?.targetTotalLength),
+    0,
+    1
+  );
+
+  if (!Number.isFinite(targetTotalLength)) {
+    targetTotalLength = intervals.reduce((sum, interval) => sum + interval.width, 0);
+  }
+
+  if (fixTotalLength) {
+    intervals = packIntervalsClockwise(scaleIntervalsToTotal(intervals, targetTotalLength), intervals[0]?.id);
+  } else {
+    targetTotalLength = intervals.reduce((sum, interval) => sum + interval.width, 0);
+  }
+
+  const hiddenMixedComboKeys = Array.isArray(shared?.hiddenMixedComboKeys)
+    ? shared.hiddenMixedComboKeys.filter(key => typeof key === 'string')
+    : [];
+
+  return {
+    intervals,
+    lambda,
+    hiddenMixedComboKeys,
+    fixTotalLength,
+    targetTotalLength,
+  };
+}
+
 function readSetupFromUrl() {
   const defaults = getDefaultSetup();
 
@@ -535,36 +572,7 @@ function readSetupFromUrl() {
 
   try {
     const shared = decodeShareState(rawState);
-    let intervals = normalizeSharedIntervals(shared?.intervals);
-    const lambda = Number.isFinite(Number(shared?.lambda)) ? Number(shared.lambda) : defaults.lambda;
-    const fixTotalLength = shared?.fixTotalLength === true;
-    let targetTotalLength = clamp(
-      Number(shared?.targetTotalLength),
-      0,
-      1
-    );
-
-    if (!Number.isFinite(targetTotalLength)) {
-      targetTotalLength = intervals.reduce((sum, interval) => sum + interval.width, 0);
-    }
-
-    if (fixTotalLength) {
-      intervals = packIntervalsClockwise(scaleIntervalsToTotal(intervals, targetTotalLength), intervals[0]?.id);
-    } else {
-      targetTotalLength = intervals.reduce((sum, interval) => sum + interval.width, 0);
-    }
-
-    const hiddenMixedComboKeys = Array.isArray(shared?.hiddenMixedComboKeys)
-      ? shared.hiddenMixedComboKeys.filter(key => typeof key === 'string')
-      : [];
-
-    return {
-      intervals,
-      lambda,
-      hiddenMixedComboKeys,
-      fixTotalLength,
-      targetTotalLength,
-    };
+    return normalizeSharedSetup(shared, defaults);
   } catch {
     return defaults;
   }
@@ -630,6 +638,8 @@ export default function App() {
   const [fixTotalLength, setFixTotalLength] = useState(initialSetup.fixTotalLength);
   const [targetTotalLength, setTargetTotalLength] = useState(initialSetup.targetTotalLength);
   const [copyStatus, setCopyStatus] = useState('idle');
+  const [jsonInput, setJsonInput] = useState('');
+  const [jsonStatus, setJsonStatus] = useState('idle');
 
   const svgRef = useRef(null);
   const [dragState, setDragState] = useState({ id: null, offset: 0 });
@@ -756,6 +766,16 @@ export default function App() {
   }), [intervals, lambda, fixTotalLength, displayedTotalLength, hiddenMixedComboKeys]);
 
   const shareUrl = useMemo(() => buildShareUrl(shareState), [shareState]);
+  const currentStateJson = useMemo(() => JSON.stringify(shareState, null, 2), [shareState]);
+
+  const applySetup = useCallback((setup) => {
+    setIntervals(setup.intervals);
+    setLambda(setup.lambda);
+    setHiddenMixedComboKeys(setup.hiddenMixedComboKeys);
+    setFixTotalLength(setup.fixTotalLength);
+    setTargetTotalLength(setup.targetTotalLength);
+    setDragState({ id: null, offset: 0 });
+  }, []);
 
   const handleCopyShareLink = useCallback(async () => {
     if (!shareUrl) return;
@@ -768,6 +788,27 @@ export default function App() {
     }
     window.setTimeout(() => setCopyStatus('idle'), 1600);
   }, [shareUrl]);
+
+  const handleCopyStateJson = useCallback(async () => {
+    try {
+      await copyText(currentStateJson);
+      setJsonStatus('copied');
+    } catch {
+      setJsonStatus('copy-failed');
+    }
+    window.setTimeout(() => setJsonStatus('idle'), 1600);
+  }, [currentStateJson]);
+
+  const handleImportStateJson = useCallback(() => {
+    try {
+      const setup = normalizeSharedSetup(JSON.parse(jsonInput));
+      applySetup(setup);
+      setJsonStatus('imported');
+    } catch {
+      setJsonStatus('invalid');
+    }
+    window.setTimeout(() => setJsonStatus('idle'), 2200);
+  }, [applySetup, jsonInput]);
 
   const addInterval = useCallback(() => {
     setIntervals(prev => {
@@ -903,7 +944,7 @@ export default function App() {
               title="Copy shareable setup link"
             >
               {copyStatus === 'copied' ? <Check size={16} /> : <Copy size={16} />}
-              {copyStatus === 'copied' ? 'Copied' : copyStatus === 'failed' ? 'Copy Failed' : 'Copy Link'}
+              {copyStatus === 'copied' ? 'Copied' : copyStatus === 'failed' ? 'Copy Failed' : 'Copy current state link'}
             </button>
           </div>
         </header>
@@ -1217,6 +1258,41 @@ export default function App() {
                 </div>
               </div>
             )}
+
+            <div className="bg-white p-5 rounded-2xl shadow-sm border border-slate-200">
+              <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 mb-4">
+                <h2 className="font-bold text-lg">State JSON</h2>
+                <button
+                  onClick={handleCopyStateJson}
+                  className="bg-slate-100 hover:bg-slate-200 text-slate-700 px-3 py-2 rounded-lg transition-colors flex items-center justify-center gap-2 text-sm font-bold"
+                >
+                  {jsonStatus === 'copied' ? <Check size={16} /> : <Copy size={16} />}
+                  {jsonStatus === 'copied' ? 'Copied' : jsonStatus === 'copy-failed' ? 'Copy Failed' : 'Copy current JSON'}
+                </button>
+              </div>
+
+              <textarea
+                value={jsonInput}
+                onChange={(e) => setJsonInput(e.target.value)}
+                placeholder="Paste state JSON"
+                spellCheck="false"
+                className="w-full min-h-40 resize-y rounded-lg border border-slate-200 bg-slate-50 p-3 font-mono text-xs text-slate-700 focus:outline-none focus:ring-2 focus:ring-blue-500"
+              />
+
+              <div className="mt-3 flex items-center justify-between gap-3">
+                <button
+                  onClick={handleImportStateJson}
+                  disabled={!jsonInput.trim()}
+                  className="bg-slate-900 hover:bg-slate-700 disabled:bg-slate-200 disabled:text-slate-400 disabled:cursor-not-allowed text-white px-3 py-2 rounded-lg transition-colors text-sm font-bold"
+                >
+                  Import JSON
+                </button>
+                <div className="min-h-5 text-right text-xs font-bold">
+                  {jsonStatus === 'imported' && <span className="text-emerald-600">Imported</span>}
+                  {jsonStatus === 'invalid' && <span className="text-red-500">Invalid JSON</span>}
+                </div>
+              </div>
+            </div>
           </div>
 
         </div>
