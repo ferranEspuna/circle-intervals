@@ -260,6 +260,16 @@ function forbiddenStartBackground(forbiddenSegments) {
   return `linear-gradient(to right, ${stops.join(', ')})`;
 }
 
+function maxValueBackground(maxValue) {
+  const allowedColor = '#dbeafe';
+  const forbiddenColor = 'rgba(248, 113, 113, 0.5)';
+  const cutoff = clamp(maxValue, 0, 1) * 100;
+
+  if (cutoff >= 100 - EPSILON) return allowedColor;
+  if (cutoff <= EPSILON) return forbiddenColor;
+  return `linear-gradient(to right, ${allowedColor} 0%, ${allowedColor} ${cutoff}%, ${forbiddenColor} ${cutoff}%, ${forbiddenColor} 100%)`;
+}
+
 function snapStartToAllowed(desiredStart, width, otherIntervals, fallbackStart) {
   const desired = normalizeTurn(desiredStart);
   if (width <= EPSILON || isStartAllowed(desired, width, otherIntervals)) return desired;
@@ -287,6 +297,32 @@ function snapStartToAllowed(desiredStart, width, otherIntervals, fallbackStart) 
   return bestStart;
 }
 
+function getClockwiseOrderFromAnchor(intervals, anchorId = intervals[0]?.id) {
+  const anchor = intervals.find(interval => interval.id === anchorId) || intervals[0];
+  if (!anchor) return [];
+
+  const anchorStart = normalizeTurn(anchor.start);
+  return [...intervals].sort((a, b) => {
+    if (a.id === anchor.id) return -1;
+    if (b.id === anchor.id) return 1;
+    return normalizeTurn(a.start - anchorStart) - normalizeTurn(b.start - anchorStart);
+  });
+}
+
+function packIntervalsConsecutively(intervals, anchorId = intervals[0]?.id) {
+  const ordered = getClockwiseOrderFromAnchor(intervals, anchorId);
+  if (ordered.length === 0) return intervals;
+
+  const packedById = new Map();
+  let currentStart = normalizeTurn(ordered[0].start);
+  ordered.forEach(interval => {
+    packedById.set(interval.id, { ...interval, start: normalizeTurn(currentStart) });
+    currentStart += interval.width;
+  });
+
+  return intervals.map(interval => packedById.get(interval.id) || interval);
+}
+
 function packIntervalsClockwise(intervals, anchorId = intervals[0]?.id) {
   if (intervals.length <= 1) {
     return intervals.map(interval => ({ ...interval, start: normalizeTurn(interval.start) }));
@@ -297,11 +333,7 @@ function packIntervalsClockwise(intervals, anchorId = intervals[0]?.id) {
 
   const anchor = intervals.find(interval => interval.id === anchorId) || intervals[0];
   const anchorStart = normalizeTurn(anchor.start);
-  const ordered = [...intervals].sort((a, b) => {
-    if (a.id === anchor.id) return -1;
-    if (b.id === anchor.id) return 1;
-    return normalizeTurn(a.start - anchorStart) - normalizeTurn(b.start - anchorStart);
-  });
+  const ordered = getClockwiseOrderFromAnchor(intervals, anchorId);
 
   const packedById = new Map();
   let currentEnd = anchorStart;
@@ -314,6 +346,10 @@ function packIntervalsClockwise(intervals, anchorId = intervals[0]?.id) {
     packedById.set(interval.id, { ...interval, start: normalizeTurn(liftedStart) });
     currentEnd = liftedStart + interval.width;
   });
+
+  if (currentEnd > anchorStart + 1 + EPSILON) {
+    return packIntervalsConsecutively(intervals, anchorId);
+  }
 
   return intervals.map(interval => packedById.get(interval.id) || interval);
 }
@@ -391,6 +427,33 @@ function resizeWithFixedTotal(intervals, intervalIndex, requestedWidth, targetTo
   }
 
   return balanceWidthsToTarget(next, targetTotal, nextIndex);
+}
+
+function resizeWithinMaxTotal(intervals, intervalIndex, requestedWidth, maxTotal = 1) {
+  if (intervals.length === 0) return intervals;
+
+  const next = intervals.map(interval => ({ ...interval }));
+  const index = ((intervalIndex % next.length) + next.length) % next.length;
+  const desiredWidth = clamp(requestedWidth, 0, maxTotal);
+  const otherWidth = next.reduce((sum, interval, i) => i === index ? sum : sum + interval.width, 0);
+  let overflow = desiredWidth + otherWidth - maxTotal;
+
+  next[index].width = desiredWidth;
+
+  if (overflow > EPSILON) {
+    for (let step = 1; step < next.length && overflow > EPSILON; step++) {
+      const donorIndex = (index + step) % next.length;
+      const reduction = Math.min(next[donorIndex].width, overflow);
+      next[donorIndex].width -= reduction;
+      overflow -= reduction;
+    }
+
+    if (overflow > EPSILON) {
+      next[index].width = Math.max(0, next[index].width - overflow);
+    }
+  }
+
+  return next;
 }
 
 // Reusable component to draw an arc on the circle
@@ -583,9 +646,7 @@ export default function App() {
       if (fixTotalLength) {
         next = resizeWithFixedTotal(prev, intervalIndex, requested, targetTotalLength);
       } else {
-        const otherWidth = prev.reduce((sum, interval) => interval.id === id ? sum : sum + interval.width, 0);
-        const width = clamp(requested, 0, Math.max(0, 1 - otherWidth));
-        next = prev.map(interval => interval.id === id ? { ...interval, width } : interval);
+        next = resizeWithinMaxTotal(prev, intervalIndex, requested, 1);
       }
 
       return packIntervalsClockwise(next, id);
@@ -760,6 +821,7 @@ export default function App() {
                   const otherIntervals = intervals.filter(i => i.id !== interval.id);
                   const forbiddenSegments = getForbiddenStartSegments(interval.width, otherIntervals);
                   const startBackground = forbiddenStartBackground(forbiddenSegments);
+                  const widthBackground = fixTotalLength ? maxValueBackground(targetTotalLength) : undefined;
 
                   return (
                     <div key={interval.id} className="p-4 bg-slate-50 rounded-xl border border-slate-100 relative group" style={{ borderLeftColor: interval.color, borderLeftWidth: '6px' }}>
@@ -827,7 +889,8 @@ export default function App() {
                             type="range" min="0" max="1" step="0.001" 
                             value={interval.width}
                             onChange={(e) => changeIntervalWidth(interval.id, parseFloat(e.target.value))}
-                            className="w-full accent-blue-500"
+                            className={fixTotalLength ? "interval-start-range w-full" : "w-full accent-blue-500"}
+                            style={widthBackground ? { background: widthBackground } : undefined}
                           />
                         </div>
                       </div>
