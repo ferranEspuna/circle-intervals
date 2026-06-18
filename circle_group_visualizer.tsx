@@ -1,5 +1,5 @@
 import React, { useState, useMemo, useRef, useCallback, useEffect } from 'react';
-import { Plus, Trash2 } from 'lucide-react';
+import { Check, Copy, Plus, Trash2 } from 'lucide-react';
 import katex from 'katex';
 import 'katex/dist/katex.min.css';
 
@@ -456,6 +456,150 @@ function resizeWithinMaxTotal(intervals, intervalIndex, requestedWidth, maxTotal
   return next;
 }
 
+function getDefaultSetup() {
+  const intervals = INITIAL_INTERVALS.map(interval => ({ ...interval }));
+  const targetTotalLength = intervals.reduce((sum, interval) => sum + interval.width, 0);
+
+  return {
+    intervals,
+    lambda: 3,
+    hiddenMixedComboKeys: [],
+    fixTotalLength: false,
+    targetTotalLength,
+  };
+}
+
+function encodeShareState(state) {
+  const json = JSON.stringify(state);
+  const bytes = encodeURIComponent(json).replace(/%([0-9A-F]{2})/g, (_, hex) => (
+    String.fromCharCode(parseInt(hex, 16))
+  ));
+
+  return btoa(bytes).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
+}
+
+function decodeShareState(value) {
+  const padded = value.replace(/-/g, '+').replace(/_/g, '/').padEnd(Math.ceil(value.length / 4) * 4, '=');
+  const bytes = atob(padded);
+  const escaped = Array.from(bytes, char => (
+    `%${char.charCodeAt(0).toString(16).padStart(2, '0')}`
+  )).join('');
+
+  return JSON.parse(decodeURIComponent(escaped));
+}
+
+function normalizeSharedIntervals(rawIntervals) {
+  if (!Array.isArray(rawIntervals)) {
+    return getDefaultSetup().intervals;
+  }
+
+  if (rawIntervals.length === 0) return [];
+
+  const usedIds = new Set();
+  let intervals = rawIntervals.map((raw, index) => {
+    let id = Number(raw?.id);
+    if (!Number.isFinite(id) || usedIds.has(id)) {
+      id = index + 1;
+      while (usedIds.has(id)) id += 1;
+    }
+    usedIds.add(id);
+
+    const fallbackColor = BASE_COLORS[index % BASE_COLORS.length];
+    const color = typeof raw?.color === 'string' && /^#[0-9a-fA-F]{6}$/.test(raw.color)
+      ? raw.color
+      : fallbackColor;
+
+    return {
+      id,
+      start: normalizeTurn(Number(raw?.start) || 0),
+      width: clamp(Number(raw?.width) || 0, 0, 1),
+      color,
+    };
+  });
+
+  const total = intervals.reduce((sum, interval) => sum + interval.width, 0);
+  if (total > 1 + EPSILON) {
+    intervals = scaleIntervalsToTotal(intervals, 1);
+  }
+
+  return packIntervalsClockwise(intervals, intervals[0]?.id);
+}
+
+function readSetupFromUrl() {
+  const defaults = getDefaultSetup();
+
+  if (typeof window === 'undefined') return defaults;
+
+  const rawState = new URLSearchParams(window.location.search).get('state');
+  if (!rawState) return defaults;
+
+  try {
+    const shared = decodeShareState(rawState);
+    let intervals = normalizeSharedIntervals(shared?.intervals);
+    const lambda = Number.isFinite(Number(shared?.lambda)) ? Number(shared.lambda) : defaults.lambda;
+    const fixTotalLength = shared?.fixTotalLength === true;
+    let targetTotalLength = clamp(
+      Number(shared?.targetTotalLength),
+      0,
+      1
+    );
+
+    if (!Number.isFinite(targetTotalLength)) {
+      targetTotalLength = intervals.reduce((sum, interval) => sum + interval.width, 0);
+    }
+
+    if (fixTotalLength) {
+      intervals = packIntervalsClockwise(scaleIntervalsToTotal(intervals, targetTotalLength), intervals[0]?.id);
+    } else {
+      targetTotalLength = intervals.reduce((sum, interval) => sum + interval.width, 0);
+    }
+
+    const hiddenMixedComboKeys = Array.isArray(shared?.hiddenMixedComboKeys)
+      ? shared.hiddenMixedComboKeys.filter(key => typeof key === 'string')
+      : [];
+
+    return {
+      intervals,
+      lambda,
+      hiddenMixedComboKeys,
+      fixTotalLength,
+      targetTotalLength,
+    };
+  } catch {
+    return defaults;
+  }
+}
+
+function buildShareUrl(state) {
+  if (typeof window === 'undefined') return '';
+
+  const url = new URL(window.location.href);
+  url.search = '';
+  url.searchParams.set('state', encodeShareState(state));
+  return url.toString();
+}
+
+async function copyText(text) {
+  if (navigator.clipboard?.writeText) {
+    try {
+      await navigator.clipboard.writeText(text);
+      return;
+    } catch {
+      // Fall back for local/dev contexts where clipboard permission is denied.
+    }
+  }
+
+  const textarea = document.createElement('textarea');
+  textarea.value = text;
+  textarea.setAttribute('readonly', '');
+  textarea.style.position = 'fixed';
+  textarea.style.opacity = '0';
+  document.body.appendChild(textarea);
+  textarea.select();
+  document.execCommand('copy');
+  document.body.removeChild(textarea);
+}
+
 // Reusable component to draw an arc on the circle
 function Arc({ r, start, end, color, className, style, ...rest }) {
   const mergedStyle = { mixBlendMode: 'multiply', ...style };
@@ -479,13 +623,13 @@ function Arc({ r, start, end, color, className, style, ...rest }) {
 }
 
 export default function App() {
-  const [intervals, setIntervals] = useState(INITIAL_INTERVALS);
-  const [lambda, setLambda] = useState(3);
-  const [hiddenMixedComboKeys, setHiddenMixedComboKeys] = useState([]);
-  const [fixTotalLength, setFixTotalLength] = useState(false);
-  const [targetTotalLength, setTargetTotalLength] = useState(
-    INITIAL_INTERVALS.reduce((sum, interval) => sum + interval.width, 0)
-  );
+  const [initialSetup] = useState(() => readSetupFromUrl());
+  const [intervals, setIntervals] = useState(initialSetup.intervals);
+  const [lambda, setLambda] = useState(initialSetup.lambda);
+  const [hiddenMixedComboKeys, setHiddenMixedComboKeys] = useState(initialSetup.hiddenMixedComboKeys);
+  const [fixTotalLength, setFixTotalLength] = useState(initialSetup.fixTotalLength);
+  const [targetTotalLength, setTargetTotalLength] = useState(initialSetup.targetTotalLength);
+  const [copyStatus, setCopyStatus] = useState('idle');
 
   const svgRef = useRef(null);
   const [dragState, setDragState] = useState({ id: null, offset: 0 });
@@ -596,6 +740,34 @@ export default function App() {
       setTargetTotalLength(totalIntervalLength);
     }
   }, [fixTotalLength, totalIntervalLength]);
+
+  const shareState = useMemo(() => ({
+    v: 1,
+    intervals: intervals.map(interval => ({
+      id: interval.id,
+      start: Number(interval.start.toFixed(6)),
+      width: Number(interval.width.toFixed(6)),
+      color: interval.color,
+    })),
+    lambda,
+    fixTotalLength,
+    targetTotalLength: Number(displayedTotalLength.toFixed(6)),
+    hiddenMixedComboKeys,
+  }), [intervals, lambda, fixTotalLength, displayedTotalLength, hiddenMixedComboKeys]);
+
+  const shareUrl = useMemo(() => buildShareUrl(shareState), [shareState]);
+
+  const handleCopyShareLink = useCallback(async () => {
+    if (!shareUrl) return;
+
+    try {
+      await copyText(shareUrl);
+      setCopyStatus('copied');
+    } catch {
+      setCopyStatus('failed');
+    }
+    window.setTimeout(() => setCopyStatus('idle'), 1600);
+  }, [shareUrl]);
 
   const addInterval = useCallback(() => {
     setIntervals(prev => {
@@ -718,10 +890,22 @@ export default function App() {
       
       <div className="max-w-[1600px] w-full">
         <header className="mb-6">
-          <h1 className="text-3xl font-bold text-slate-900 mb-2">Circle Group Visualizer</h1>
-          <p className="text-slate-600">
-            Explore additive combinatorics on the circle group <InlineMath>{'\\mathbb{T} = \\mathbb{R}/\\mathbb{Z}'}</InlineMath>. Visualizing interval sets <InlineMath>{'A'}</InlineMath>, sumsets <InlineMath>{'A+A'}</InlineMath>, dilations <InlineMath>{'\\lambda A'}</InlineMath>, and mixed sets <InlineMath>{'A+A-\\lambda A'}</InlineMath>.
-          </p>
+          <div className="flex flex-col sm:flex-row sm:items-start sm:justify-between gap-4">
+            <div>
+              <h1 className="text-3xl font-bold text-slate-900 mb-2">Circle Group Visualizer</h1>
+              <p className="text-slate-600">
+                Explore additive combinatorics on the circle group <InlineMath>{'\\mathbb{T} = \\mathbb{R}/\\mathbb{Z}'}</InlineMath>. Visualizing interval sets <InlineMath>{'A'}</InlineMath>, sumsets <InlineMath>{'A+A'}</InlineMath>, dilations <InlineMath>{'\\lambda A'}</InlineMath>, and mixed sets <InlineMath>{'A+A-\\lambda A'}</InlineMath>.
+              </p>
+            </div>
+            <button
+              onClick={handleCopyShareLink}
+              className="shrink-0 bg-slate-900 hover:bg-slate-700 text-white px-3 py-2 rounded-lg transition-colors flex items-center justify-center gap-2 text-sm font-bold"
+              title="Copy shareable setup link"
+            >
+              {copyStatus === 'copied' ? <Check size={16} /> : <Copy size={16} />}
+              {copyStatus === 'copied' ? 'Copied' : copyStatus === 'failed' ? 'Copy Failed' : 'Copy Link'}
+            </button>
+          </div>
         </header>
 
         <div className="flex flex-col xl:flex-row gap-8 items-start">
